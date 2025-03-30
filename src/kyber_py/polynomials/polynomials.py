@@ -252,6 +252,27 @@ def _decode_polynomial(input_bytes_array, d, n=256, q=3329):
     
     return coeffs
 
+@nb.vectorize([nb.int32(nb.int32, nb.int32, nb.int32)])
+def _ntt_scalar_mul(coef, scalar, q=3329):
+    """
+    Векторизованное умножение NTT-коэффициента на скаляр по модулю q
+    """
+    return (coef * scalar) % q
+
+@nb.vectorize([nb.int32(nb.int32, nb.int32, nb.int32)])
+def _ntt_add_mod_q(x, y, q=3329):
+    """
+    Векторизованное сложение двух NTT-коэффициентов по модулю q
+    """
+    return (x + y) % q
+
+@nb.vectorize([nb.int32(nb.int32, nb.int32, nb.int32)])
+def _ntt_sub_mod_q(x, y, q=3329):
+    """
+    Векторизованное вычитание двух NTT-коэффициентов по модулю q
+    """
+    return (x - y) % q
+
 class PolynomialRingKyber(PolynomialRing):
     """
     Initialise the polynomial ring:
@@ -497,6 +518,48 @@ class PolynomialKyberNTT(PolynomialKyber):
         )
         return new_coeffs
 
+    def _add_(self, other):
+        if isinstance(other, type(self)):
+            # Преобразуем списки коэффициентов в numpy массивы
+            x_array = np.array(self.coeffs, dtype=np.int32)
+            y_array = np.array(other.coeffs, dtype=np.int32)
+            
+            # Вызываем векторизованную JIT-функцию с явной передачей всех параметров
+            result_coeffs = _ntt_add_mod_q(x_array, y_array, 3329)
+            
+            # Преобразуем результат обратно в список Python
+            return result_coeffs.tolist()
+        elif isinstance(other, int):
+            # Для сложения с целым числом копируем коэффициенты и изменяем нулевой
+            new_coeffs = self.coeffs.copy()
+            new_coeffs[0] = (new_coeffs[0] + other) % 3329
+            return new_coeffs
+        else:
+            raise NotImplementedError(
+                f"Polynomials can only be added to each other, {type(other) = }, {type(self) = }"
+            )
+    
+    def _sub_(self, other):
+        if isinstance(other, type(self)):
+            # Преобразуем списки коэффициентов в numpy массивы
+            x_array = np.array(self.coeffs, dtype=np.int32)
+            y_array = np.array(other.coeffs, dtype=np.int32)
+            
+            # Вызываем векторизованную JIT-функцию с явной передачей всех параметров
+            result_coeffs = _ntt_sub_mod_q(x_array, y_array, 3329)
+            
+            # Преобразуем результат обратно в список Python
+            return result_coeffs.tolist()
+        elif isinstance(other, int):
+            # Для вычитания целого числа копируем коэффициенты и изменяем нулевой
+            new_coeffs = self.coeffs.copy()
+            new_coeffs[0] = (new_coeffs[0] - other) % 3329
+            return new_coeffs
+        else:
+            raise NotImplementedError(
+                f"Polynomials can only be subtracted from each other, {type(other) = }, {type(self) = }"
+            )
+
     def __add__(self, other):
         new_coeffs = self._add_(other)
         return self.parent(new_coeffs, is_ntt=True)
@@ -509,7 +572,14 @@ class PolynomialKyberNTT(PolynomialKyber):
         if isinstance(other, type(self)):
             new_coeffs = self._ntt_multiplication(other)
         elif isinstance(other, int):
-            new_coeffs = [(c * other) % 3329 for c in self.coeffs]
+            # Преобразуем список коэффициентов в numpy массив
+            coeffs_array = np.array(self.coeffs, dtype=np.int32)
+            
+            # Вызываем векторизованную JIT-функцию
+            result_coeffs = _ntt_scalar_mul(coeffs_array, other)
+            
+            # Преобразуем результат обратно в список Python
+            new_coeffs = result_coeffs.tolist()
         else:
             raise NotImplementedError(
                 f"Polynomials can only be multiplied by each other, or scaled by integers, {type(other) = }, {type(self) = }"

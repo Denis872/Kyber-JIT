@@ -1,5 +1,63 @@
 import random
+import numba as nb
+import numpy as np
 
+@nb.njit
+def _optimized_schoolbook_multiplication(a, b, n, q):
+    """
+    Оптимизированная реализация умножения полиномов методом школы.
+    a, b - массивы коэффициентов полиномов
+    n - степень полинома
+    q - модуль поля
+    """
+    new_coeffs = np.zeros(n, dtype=np.int32)
+    
+    # Первая часть умножения: положительные индексы
+    for i in range(n):
+        for j in range(0, n - i):
+            new_coeffs[i + j] = (new_coeffs[i + j] + a[i] * b[j]) % q
+    
+    # Вторая часть умножения: учет отрицательных индексов из-за модуля X^n + 1
+    for j in range(1, n):
+        for i in range(n - j, n):
+            new_coeffs[i + j - n] = (new_coeffs[i + j - n] - a[i] * b[j]) % q
+    
+    return new_coeffs
+
+@nb.vectorize([nb.int32(nb.int32, nb.int32, nb.int32)])
+def _scalar_multiply(coef, scalar, q):
+    """
+    Векторизованное умножение коэффициента на скаляр по модулю q
+    """
+    return (coef * scalar) % q
+
+@nb.vectorize([nb.int32(nb.int32, nb.int32, nb.int32)])
+def _add_mod_q_vec(x, y, q):
+    """
+    Векторизованное сложение двух чисел по модулю q
+    """
+    return (x + y) % q
+
+@nb.vectorize([nb.int32(nb.int32, nb.int32, nb.int32)])
+def _sub_mod_q_vec(x, y, q):
+    """
+    Векторизованное вычитание двух чисел по модулю q
+    """
+    return (x - y) % q
+
+@nb.vectorize([nb.int32(nb.int32, nb.int32)])
+def _reduce_coefficient(c, q):
+    """
+    Векторизованное сокращение коэффициента по модулю q
+    """
+    return c % q
+
+@nb.vectorize([nb.int32(nb.int32, nb.int32)])
+def _negate_coefficient(c, q):
+    """
+    Векторизованное отрицание коэффициента по модулю q
+    """
+    return (-c) % q
 
 class PolynomialRing:
     """
@@ -76,7 +134,9 @@ class Polynomial:
         """
         Reduce all coefficients modulo q
         """
-        self.coeffs = [c % self.parent.q for c in self.coeffs]
+        coeffs_array = np.array(self.coeffs, dtype=np.int32)
+        result_coeffs = _reduce_coefficient(coeffs_array, self.parent.q)
+        self.coeffs = result_coeffs.tolist()
         return self
 
     def _add_mod_q(self, x, y):
@@ -97,38 +157,42 @@ class Polynomial:
         suitible for all R_q = F_1[X]/(X^n + 1)
         """
         n = self.parent.n
-        a = self.coeffs
-        b = other.coeffs
-        new_coeffs = [0 for _ in range(n)]
-        for i in range(n):
-            for j in range(0, n - i):
-                new_coeffs[i + j] += a[i] * b[j]
-        for j in range(1, n):
-            for i in range(n - j, n):
-                new_coeffs[i + j - n] -= a[i] * b[j]
-        return [c % self.parent.q for c in new_coeffs]
+        q = self.parent.q
+        a = np.array(self.coeffs, dtype=np.int32)
+        b = np.array(other.coeffs, dtype=np.int32)
+        
+        # Вызываем оптимизированную JIT-функцию
+        result_coeffs = _optimized_schoolbook_multiplication(a, b, n, q)
+        
+        # Преобразуем результат обратно в список Python
+        return result_coeffs.tolist()
 
     def __neg__(self):
         """
         Returns -f, by negating all coefficients
         """
-        neg_coeffs = [(-x % self.parent.q) for x in self.coeffs]
-        return self.parent(neg_coeffs)
+        coeffs_array = np.array(self.coeffs, dtype=np.int32)
+        result_coeffs = _negate_coefficient(coeffs_array, self.parent.q)
+        return self.parent(result_coeffs.tolist())
 
     def _add_(self, other):
+        q = self.parent.q
         if isinstance(other, type(self)):
-            new_coeffs = [
-                self._add_mod_q(x, y)
-                for x, y in zip(self.coeffs, other.coeffs)
-            ]
+            # Преобразуем списки коэффициентов в numpy массивы
+            x_array = np.array(self.coeffs, dtype=np.int32)
+            y_array = np.array(other.coeffs, dtype=np.int32)
+            
+            # Вызываем векторизованную JIT-функцию
+            result_coeffs = _add_mod_q_vec(x_array, y_array, q)
+            return result_coeffs.tolist()
         elif isinstance(other, int):
             new_coeffs = self.coeffs.copy()
             new_coeffs[0] = self._add_mod_q(new_coeffs[0], other)
+            return new_coeffs
         else:
             raise NotImplementedError(
                 "Polynomials can only be added to each other"
             )
-        return new_coeffs
 
     def __add__(self, other):
         new_coeffs = self._add_(other)
@@ -142,19 +206,23 @@ class Polynomial:
         return self
 
     def _sub_(self, other):
+        q = self.parent.q
         if isinstance(other, type(self)):
-            new_coeffs = [
-                self._sub_mod_q(x, y)
-                for x, y in zip(self.coeffs, other.coeffs)
-            ]
+            # Преобразуем списки коэффициентов в numpy массивы
+            x_array = np.array(self.coeffs, dtype=np.int32)
+            y_array = np.array(other.coeffs, dtype=np.int32)
+            
+            # Вызываем векторизованную JIT-функцию
+            result_coeffs = _sub_mod_q_vec(x_array, y_array, q)
+            return result_coeffs.tolist()
         elif isinstance(other, int):
             new_coeffs = self.coeffs.copy()
             new_coeffs[0] = self._sub_mod_q(new_coeffs[0], other)
+            return new_coeffs
         else:
             raise NotImplementedError(
                 "Polynomials can only be subtracted from each other"
             )
-        return new_coeffs
 
     def __sub__(self, other):
         new_coeffs = self._sub_(other)
@@ -171,7 +239,9 @@ class Polynomial:
         if isinstance(other, type(self)):
             new_coeffs = self._schoolbook_multiplication(other)
         elif isinstance(other, int):
-            new_coeffs = [(c * other) % self.parent.q for c in self.coeffs]
+            coeffs_array = np.array(self.coeffs, dtype=np.int32)
+            result_coeffs = _scalar_multiply(coeffs_array, other, self.parent.q)
+            new_coeffs = result_coeffs.tolist()
         else:
             raise NotImplementedError(
                 "Polynomials can only be multiplied by each other, or scaled by integers"
