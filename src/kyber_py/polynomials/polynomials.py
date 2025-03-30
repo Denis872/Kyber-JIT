@@ -1,6 +1,256 @@
 from ..utilities.utils import bit_count
 from .polynomials_generic import PolynomialRing, Polynomial
+import numba as nb
+import numpy as np
 
+@nb.njit
+def _ntt_forward_transform(coeffs, zetas, q=3329):
+    """
+    Оптимизированная реализация прямого NTT преобразования
+    """
+    k, l = 1, 128
+    coeffs_copy = coeffs.copy()
+    
+    while l >= 2:
+        start = 0
+        while start < 256:
+            zeta = zetas[k]
+            k = k + 1
+            for j in range(start, start + l):
+                t = (zeta * coeffs_copy[j + l]) % q
+                coeffs_copy[j + l] = (coeffs_copy[j] - t) % q
+                coeffs_copy[j] = (coeffs_copy[j] + t) % q
+            start = start + 2 * l
+        l = l >> 1
+
+    # Финальное модульное сокращение
+    for j in range(256):
+        coeffs_copy[j] = coeffs_copy[j] % q
+    
+    return coeffs_copy
+
+@nb.njit
+def _ntt_inverse_transform(coeffs, zetas, ntt_f, q=3329):
+    """
+    Оптимизированная реализация обратного NTT преобразования
+    """
+    l, l_upper = 2, 128
+    k = l_upper - 1
+    coeffs_copy = coeffs.copy()
+    
+    while l <= 128:
+        start = 0
+        while start < 256:
+            zeta = zetas[k]
+            k = k - 1
+            for j in range(start, start + l):
+                t = coeffs_copy[j]
+                coeffs_copy[j] = (t + coeffs_copy[j + l]) % q
+                coeffs_copy[j + l] = (coeffs_copy[j + l] - t) % q
+                coeffs_copy[j + l] = (zeta * coeffs_copy[j + l]) % q
+            start = start + 2 * l
+        l = l << 1
+
+    for j in range(256):
+        coeffs_copy[j] = (coeffs_copy[j] * ntt_f) % q
+    
+    return coeffs_copy
+
+@nb.njit
+def _ntt_base_mul(a0, a1, b0, b1, zeta, q=3329):
+    """
+    Оптимизированное базовое умножение для NTT
+    """
+    r0 = (a0 * b0 + zeta * a1 * b1) % q
+    r1 = (a1 * b0 + a0 * b1) % q
+    return r0, r1
+
+@nb.njit
+def _ntt_coefficient_mul(f_coeffs, g_coeffs, zetas, q=3329):
+    """
+    Оптимизированное умножение коэффициентов полиномов в NTT форме
+    """
+    new_coeffs = np.zeros(256, dtype=np.int32)
+    for i in range(64):
+        # Базовое умножение для первой пары
+        a0, a1 = f_coeffs[4*i+0], f_coeffs[4*i+1]
+        b0, b1 = g_coeffs[4*i+0], g_coeffs[4*i+1]
+        zeta = zetas[64 + i]
+        r0 = (a0 * b0 + zeta * a1 * b1) % q
+        r1 = (a1 * b0 + a0 * b1) % q
+        
+        # Базовое умножение для второй пары
+        a0, a1 = f_coeffs[4*i+2], f_coeffs[4*i+3]
+        b0, b1 = g_coeffs[4*i+2], g_coeffs[4*i+3]
+        zeta_neg = q - zetas[64 + i]  # -zeta mod q
+        r2 = (a0 * b0 + zeta_neg * a1 * b1) % q
+        r3 = (a1 * b0 + a0 * b1) % q
+        
+        # Сохраняем результаты
+        new_coeffs[4*i+0] = r0
+        new_coeffs[4*i+1] = r1
+        new_coeffs[4*i+2] = r2
+        new_coeffs[4*i+3] = r3
+    
+    return new_coeffs
+
+@nb.njit
+def _cbd_optimized(input_bytes_array, eta, q=3329):
+    """
+    Оптимизированная реализация Centered Binomial Distribution.
+    Работает напрямую с байтами как numpy массивом.
+    """
+    coefficients = np.zeros(256, dtype=np.int32)
+    mask = (1 << eta) - 1
+    mask2 = (1 << 2 * eta) - 1
+    
+    # Расчет количества бит на одну выборку
+    bits_per_sample = 2 * eta
+    
+    # Текущее значение, накопленные биты и позиция
+    current_val = 0
+    bits_accumulated = 0
+    coef_index = 0
+    
+    # Проходим по всем байтам
+    for i in range(len(input_bytes_array)):
+        byte_val = input_bytes_array[i]
+        
+        # Добавляем 8 бит к текущим битам
+        current_val |= (int(byte_val) << bits_accumulated)
+        bits_accumulated += 8
+        
+        # Пока у нас достаточно бит для извлечения выборки
+        while bits_accumulated >= bits_per_sample and coef_index < 256:
+            # Извлекаем выборку
+            x = current_val & mask2
+            
+            # Подсчет установленных битов
+            a_bits = x & mask
+            b_bits = (x >> eta) & mask
+            
+            a = 0
+            b = 0
+            
+            # Подсчет установленных битов для a
+            while a_bits > 0:
+                a += a_bits & 1
+                a_bits >>= 1
+                
+            # Подсчет установленных битов для b
+            while b_bits > 0:
+                b += b_bits & 1
+                b_bits >>= 1
+            
+            # Сохраняем результат
+            coefficients[coef_index] = (a - b) % q
+            coef_index += 1
+            
+            # Сдвигаем биты для следующей выборки
+            current_val >>= bits_per_sample
+            bits_accumulated -= bits_per_sample
+    
+    return coefficients
+
+@nb.vectorize([nb.int32(nb.int32, nb.int32, nb.int32)])
+def _compress_element(x, d, q=3329):
+    """
+    Векторизованная функция сжатия коэффициента
+    Compute round((2^d / q) * x) % 2^d
+    """
+    t = 1 << d
+    y = (t * x + 1664) // q  # 1664 = 3329 // 2
+    return y % t
+
+@nb.vectorize([nb.int32(nb.int32, nb.int32, nb.int32)])
+def _decompress_element(x, d, q=3329):
+    """
+    Векторизованная функция распаковки коэффициента
+    Compute round((q / 2^d) * x)
+    """
+    t = 1 << (d - 1)
+    y = (q * x + t) >> d
+    return y
+
+@nb.njit
+def _encode_polynomial(coeffs, d):
+    """
+    Оптимизированное кодирование полинома в байты.
+    Используем более безопасный подход для работы с большими числами.
+    """
+    # Создаем буфер для результата как numpy массив вместо bytearray
+    result_bytes = np.zeros(32 * d, dtype=np.uint8)
+    
+    # Обрабатываем каждый коэффициент напрямую, не используя битовые сдвиги для больших чисел
+    # вместо этого заполняем байты напрямую
+    acc = 0  # аккумулятор для битов
+    bit_pos = 0  # текущая позиция бита
+    byte_pos = 0  # текущая позиция байта
+    
+    # Обрабатываем коэффициенты в правильном порядке
+    for i in range(256):
+        coef = coeffs[i]
+        # Добавляем d бит от текущего коэффициента в аккумулятор
+        acc |= (coef << bit_pos)
+        bit_pos += d
+        
+        # Пока у нас есть хотя бы 8 бит, записываем их в результат
+        while bit_pos >= 8:
+            if byte_pos < len(result_bytes):
+                result_bytes[byte_pos] = acc & 0xFF
+                byte_pos += 1
+                acc >>= 8
+                bit_pos -= 8
+            else:
+                # Защита от переполнения буфера
+                break
+    
+    # Записываем оставшиеся биты, если они есть
+    if bit_pos > 0 and byte_pos < len(result_bytes):
+        result_bytes[byte_pos] = acc & 0xFF
+    
+    return result_bytes
+
+@nb.njit
+def _decode_polynomial(input_bytes_array, d, n=256, q=3329):
+    """
+    Оптимизированное декодирование полинома из байтов.
+    Работает напрямую с байтами как numpy массивом.
+    """
+    if d == 12:
+        m = q
+    else:
+        m = 1 << d
+        
+    # Подготовим массив для коэффициентов
+    coeffs = np.zeros(n, dtype=np.int32)
+    
+    mask = (1 << d) - 1
+    bit_pos = 0  # текущая битовая позиция
+    coef_idx = 0  # индекс текущего коэффициента
+    current_val = 0  # текущее накопленное значение
+    bits_in_val = 0  # сколько бит уже накоплено
+        
+    # Проходим по всем байтам входных данных
+    for i in range(len(input_bytes_array)):
+        byte_val = input_bytes_array[i]
+        
+        # Добавляем 8 бит к текущему значению
+        current_val |= (int(byte_val) << bits_in_val)
+        bits_in_val += 8
+        
+        # Пока у нас достаточно бит для извлечения d-битного значения
+        while bits_in_val >= d and coef_idx < n:
+            # Извлекаем d бит
+            coef = current_val & mask
+            coeffs[coef_idx] = coef % m
+            coef_idx += 1
+            
+            # Сдвигаем для следующего коэффициента
+            current_val >>= d
+            bits_in_val -= d
+    
+    return coeffs
 
 class PolynomialRingKyber(PolynomialRing):
     """
@@ -66,17 +316,15 @@ class PolynomialRingKyber(PolynomialRing):
         For Kyber, this is 64 eta.
         """
         assert 64 * eta == len(input_bytes)
-        coefficients = [0 for _ in range(256)]
-        b_int = int.from_bytes(input_bytes, "little")
-        mask = (1 << eta) - 1
-        mask2 = (1 << 2 * eta) - 1
-        for i in range(256):
-            x = b_int & mask2
-            a = bit_count(x & mask)
-            b = bit_count((x >> eta) & mask)
-            b_int >>= 2 * eta
-            coefficients[i] = (a - b) % 3329
-        return self(coefficients, is_ntt=is_ntt)
+        
+        # Преобразуем байты в numpy массив перед вызовом JIT-функции
+        input_bytes_array = np.array(list(input_bytes), dtype=np.uint8)
+        
+        # Вызываем оптимизированную JIT-функцию
+        result_coeffs = _cbd_optimized(input_bytes_array, eta)
+        
+        # Преобразуем результат обратно в список Python
+        return self(result_coeffs.tolist(), is_ntt=is_ntt)
 
     def decode(self, input_bytes, d, is_ntt=False):
         """
@@ -90,20 +338,14 @@ class PolynomialRingKyber(PolynomialRing):
                 f"input bytes must be a multiple of (polynomial degree) / 8, {256*d = }, {len(input_bytes)*8 = }"
             )
 
-        # Set the modulus
-        if d == 12:
-            m = 3329
-        else:
-            m = 1 << d
-
-        coeffs = [0 for _ in range(256)]
-        b_int = int.from_bytes(input_bytes, "little")
-        mask = (1 << d) - 1
-        for i in range(256):
-            coeffs[i] = (b_int & mask) % m
-            b_int >>= d
-
-        return self(coeffs, is_ntt=is_ntt)
+        # Преобразуем байты в numpy массив перед вызовом JIT-функции
+        input_bytes_array = np.array(list(input_bytes), dtype=np.uint8)
+        
+        # Вызываем оптимизированную JIT-функцию
+        result_coeffs = _decode_polynomial(input_bytes_array, d)
+        
+        # Преобразуем результат обратно в список Python и создаем полином
+        return self(result_coeffs.tolist(), is_ntt=is_ntt)
 
     def __call__(self, coefficients, is_ntt=False):
         if not is_ntt:
@@ -129,28 +371,14 @@ class PolynomialKyber(Polynomial):
         """
         Encode (Inverse of Algorithm 3)
         """
-        t = 0
-        for i in range(255):
-            t |= self.coeffs[256 - i - 1]
-            t <<= d
-        t |= self.coeffs[0]
-        return t.to_bytes(32 * d, "little")
-
-    def _compress_ele(self, x, d):
-        """
-        Compute round((2^d / q) * x) % 2^d
-        """
-        t = 1 << d
-        y = (t * x + 1664) // 3329  # 1664 = 3329 // 2
-        return y % t
-
-    def _decompress_ele(self, x, d):
-        """
-        Compute round((q / 2^d) * x)
-        """
-        t = 1 << (d - 1)
-        y = (3329 * x + t) >> d
-        return y
+        # Преобразуем список коэффициентов в numpy массив
+        coeffs_array = np.array(self.coeffs, dtype=np.int32)
+        
+        # Вызываем оптимизированную JIT-функцию
+        result_np_array = _encode_polynomial(coeffs_array, d)
+        
+        # Преобразуем результат в bytes
+        return bytes(result_np_array)
 
     def compress(self, d):
         """
@@ -158,7 +386,14 @@ class PolynomialKyber(Polynomial):
 
         NOTE: This is lossy compression
         """
-        self.coeffs = [self._compress_ele(c, d) for c in self.coeffs]
+        # Преобразуем список коэффициентов в numpy массив
+        coeffs_array = np.array(self.coeffs, dtype=np.int32)
+        
+        # Вызываем векторизованную JIT-функцию с явной передачей всех параметров
+        result_coeffs = _compress_element(coeffs_array, d, 3329)
+        
+        # Преобразуем результат обратно в список Python
+        self.coeffs = result_coeffs.tolist()
         return self
 
     def decompress(self, d):
@@ -169,7 +404,14 @@ class PolynomialKyber(Polynomial):
         x' = decompress(compress(x)), which x' != x, but is
         close in magnitude.
         """
-        self.coeffs = [self._decompress_ele(c, d) for c in self.coeffs]
+        # Преобразуем список коэффициентов в numpy массив
+        coeffs_array = np.array(self.coeffs, dtype=np.int32)
+        
+        # Вызываем векторизованную JIT-функцию с явной передачей всех параметров
+        result_coeffs = _decompress_element(coeffs_array, d, 3329)
+        
+        # Преобразуем результат обратно в список Python
+        self.coeffs = result_coeffs.tolist()
         return self
 
     def to_ntt(self):
@@ -177,25 +419,15 @@ class PolynomialKyber(Polynomial):
         Convert a polynomial to number-theoretic transform (NTT) form.
         The input is in standard order, the output is in bit-reversed order.
         """
-        k, l = 1, 128
-        coeffs = self.coeffs
-        zetas = self.parent.ntt_zetas
-        while l >= 2:
-            start = 0
-            while start < 256:
-                zeta = zetas[k]
-                k = k + 1
-                for j in range(start, start + l):
-                    t = zeta * coeffs[j + l]
-                    coeffs[j + l] = coeffs[j] - t
-                    coeffs[j] = coeffs[j] + t
-                start = l + (j + 1)
-            l = l >> 1
-
-        for j in range(256):
-            coeffs[j] = coeffs[j] % 3329
-
-        return self.parent(coeffs, is_ntt=True)
+        # Преобразуем список коэффициентов в numpy массив для Numba
+        coeffs_array = np.array(self.coeffs, dtype=np.int32)
+        zetas_array = np.array(self.parent.ntt_zetas, dtype=np.int32)
+        
+        # Вызываем оптимизированную JIT-функцию
+        result_coeffs = _ntt_forward_transform(coeffs_array, zetas_array)
+        
+        # Преобразуем результат обратно в список Python
+        return self.parent(result_coeffs.tolist(), is_ntt=True)
 
     def from_ntt(self):
         """
@@ -222,62 +454,39 @@ class PolynomialKyberNTT(PolynomialKyber):
         Convert a polynomial from number-theoretic transform (NTT) form in place
         The input is in bit-reversed order, the output is in standard order.
         """
-        l, l_upper = 2, 128
-        k = l_upper - 1
-        coeffs = self.coeffs
-        zetas = self.parent.ntt_zetas
-        while l <= 128:
-            start = 0
-            while start < 256:
-                zeta = zetas[k]
-                k = k - 1
-                for j in range(start, start + l):
-                    t = coeffs[j]
-                    coeffs[j] = t + coeffs[j + l]
-                    coeffs[j + l] = coeffs[j + l] - t
-                    coeffs[j + l] = zeta * coeffs[j + l]
-                start = j + l + 1
-            l = l << 1
-
-        f = self.parent.ntt_f
-        for j in range(256):
-            coeffs[j] = (coeffs[j] * f) % 3329
-
-        return self.parent(coeffs, is_ntt=False)
+        # Преобразуем список коэффициентов в numpy массив для Numba
+        coeffs_array = np.array(self.coeffs, dtype=np.int32)
+        zetas_array = np.array(self.parent.ntt_zetas, dtype=np.int32)
+        ntt_f = self.parent.ntt_f
+        
+        # Вызываем оптимизированную JIT-функцию
+        result_coeffs = _ntt_inverse_transform(coeffs_array, zetas_array, ntt_f)
+        
+        # Преобразуем результат обратно в список Python
+        return self.parent(result_coeffs.tolist(), is_ntt=False)
 
     @staticmethod
     def _ntt_base_multiplication(a0, a1, b0, b1, zeta):
         """
         Base case for ntt multiplication
         """
-        r0 = (a0 * b0 + zeta * a1 * b1) % 3329
-        r1 = (a1 * b0 + a0 * b1) % 3329
-        return r0, r1
+        return _ntt_base_mul(a0, a1, b0, b1, zeta)
 
     def _ntt_coefficient_multiplication(self, f_coeffs, g_coeffs):
         """
         Given the coefficients of two polynomials compute the coefficients of
         their product
         """
-        new_coeffs = []
-        zetas = self.parent.ntt_zetas
-        for i in range(64):
-            r0, r1 = self._ntt_base_multiplication(
-                f_coeffs[4 * i + 0],
-                f_coeffs[4 * i + 1],
-                g_coeffs[4 * i + 0],
-                g_coeffs[4 * i + 1],
-                zetas[64 + i],
-            )
-            r2, r3 = self._ntt_base_multiplication(
-                f_coeffs[4 * i + 2],
-                f_coeffs[4 * i + 3],
-                g_coeffs[4 * i + 2],
-                g_coeffs[4 * i + 3],
-                -zetas[64 + i],
-            )
-            new_coeffs += [r0, r1, r2, r3]
-        return new_coeffs
+        # Преобразуем списки коэффициентов в numpy массивы
+        f_array = np.array(f_coeffs, dtype=np.int32)
+        g_array = np.array(g_coeffs, dtype=np.int32)
+        zetas_array = np.array(self.parent.ntt_zetas, dtype=np.int32)
+        
+        # Вызываем оптимизированную JIT-функцию
+        result_coeffs = _ntt_coefficient_mul(f_array, g_array, zetas_array)
+        
+        # Преобразуем результат обратно в список Python
+        return result_coeffs.tolist()
 
     def _ntt_multiplication(self, other):
         """
