@@ -1,0 +1,77 @@
+{
+  "version": "Kyber768",
+  "total_time": 0.01799774169921875,
+  "operations": [
+    {
+      "operation": "NTT",
+      "average_time": 2.0020008087158203e-05,
+      "total_time": 0.0020020008087158203,
+      "iterations": 100,
+      "function_calls": {},
+      "operation_counts": {}
+    },
+    {
+      "operation": "Inverse NTT",
+      "average_time": 3.9968490600585934e-05,
+      "total_time": 0.003996849060058594,
+      "iterations": 100,
+      "function_calls": {},
+      "operation_counts": {}
+    },
+    {
+      "operation": "Addition",
+      "average_time": 2.0003318786621095e-05,
+      "total_time": 0.0020003318786621094,
+      "iterations": 100,
+      "function_calls": {},
+      "operation_counts": {}
+    },
+    {
+      "operation": "Subtraction",
+      "average_time": 1.9996166229248048e-05,
+      "total_time": 0.0019996166229248047,
+      "iterations": 100,
+      "function_calls": {},
+      "operation_counts": {}
+    },
+    {
+      "operation": "Multiplication",
+      "average_time": 0.0001400136947631836,
+      "total_time": 0.01400136947631836,
+      "iterations": 100,
+      "function_calls": {},
+      "operation_counts": {}
+    },
+    {
+      "operation": "Multiplication (NTT domain)",
+      "average_time": 5.9988498687744144e-05,
+      "total_time": 0.005998849868774414,
+      "iterations": 100,
+      "function_calls": {},
+      "operation_counts": {}
+    },
+    {
+      "operation": "Compression/Decompression",
+      "average_time": 2.0010471343994142e-05,
+      "total_time": 0.002001047134399414,
+      "iterations": 100,
+      "function_calls": {},
+      "operation_counts": {}
+    },
+    {
+      "operation": "Centered binomial distribution",
+      "average_time": 0.00016548633575439454,
+      "total_time": 0.016548633575439453,
+      "iterations": 100,
+      "function_calls": {
+        "PolynomialRingKyber.cbd": 101
+      },
+      "operation_counts": {
+        "PolynomialRingKyber.cbd:-": 606,
+        "PolynomialRingKyber.cbd:*": 202,
+        "PolynomialRingKyber.cbd:/": 606,
+        "PolynomialRingKyber.cbd:==": 101
+      }
+    }
+  ]
+}

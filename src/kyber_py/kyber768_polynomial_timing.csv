@@ -1,0 +1,9 @@
+Операция,Среднее время (мс),Всего вызовов функций
+NTT,0.020020008087158203,0
+Inverse NTT,0.03996849060058594,0
+Addition,0.020003318786621094,0
+Subtraction,0.019996166229248047,0
+Multiplication,0.1400136947631836,0
+Multiplication (NTT domain),0.05998849868774414,0
+Compression/Decompression,0.02001047134399414,0
+Centered binomial distribution,0.16548633575439453,101
